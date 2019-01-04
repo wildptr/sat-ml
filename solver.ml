@@ -37,8 +37,8 @@ module S = Set.Make(Int)
 
 type decision_level = {
   guess : (int * bool) option; (* None for top-level *)
-  mutable inferred_vars : int list
-  (* mutable active_clauses : S.t *)
+  mutable inferred_vars : int list;
+  mutable active_clauses : S.t
 }
 
 type solver = {
@@ -87,6 +87,9 @@ let add_clause s cls =
   let cls_id = DynArray.length s.clauses in
   DynArray.add s.clauses cls;
   add_to_watch_sets s cls_id cls;
+  s.trail |> List.iter begin fun dec ->
+    dec.active_clauses <- S.add cls_id dec.active_clauses;
+  end;
   cls_id
 
 let add_conflict_clause s =
@@ -97,21 +100,6 @@ let add_conflict_clause s =
 
 let get_clause s cls_id =
   DynArray.get s.clauses cls_id
-
-(* let get_active_clauses s =
-  (List.hd s.trail).active_clauses *)
-
-(*
-let activate_clause s cls_id =
-  Format.printf "activate clause (%a)@."
-    (pp_clause s.name_table) (get_clause s cls_id);
-  s.active_clauses <- S.add cls_id s.active_clauses
-
-let deactivate_clause s cls_id =
-  Format.printf "deactivate clause (%a)@."
-    (pp_clause s.name_table) (get_clause s cls_id);
-  s.active_clauses <- S.remove cls_id s.active_clauses
-*)
 
 let cancel_val s i =
   Format.printf "unset %s@." s.name_table.(i);
@@ -142,14 +130,9 @@ let rec backtrack s confl_cls =
   else
     s.trail <- trail'
 
-let check_sanity s =
-  s.clauses |> DynArray.iter begin fun cls ->
-    match clause_status s.valn cls with
-    | Unsat ->
-      Format.printf "BUG: under current valuation clause (%a) is unsatisfiable!@."
-        (pp_clause s.name_table) cls;
-      raise Bug
-    | _ -> ()
+let all_sat s =
+  s.clauses |> DynArray.to_list |> List.for_all begin fun cls ->
+    match clause_status s.valn cls with Satisfied -> true | _ -> false
   end
 
 let no_unit_clauses s =
@@ -160,15 +143,15 @@ let no_unit_clauses s =
 (* after calling infer there should be no variable setting whose value will
    immediately cause a clause to be unsat *)
 let infer s =
-  (* let ac' = ref S.empty in *)
-  let rec loop () =
-    (* if S.is_empty ac then No_Conflict *)
-    begin
-      let q = Queue.create () in
+  let head = List.hd s.trail in
+  let q = Queue.create () in (* literals in unit clauses *)
+  let sat = Queue.create () in (* satisfied clauses *)
+  let rec loop w =
+    if S.is_empty w then No_Conflict
+    else begin
       assert (s.trail <> []);
-      let head = List.hd s.trail in
-      (* ac' := S.empty; *)
-      for cls_id = 0 to DynArray.length s.clauses - 1 do
+      let w' = ref S.empty in
+      w |> S.iter begin fun cls_id ->
         let cls = get_clause s cls_id in
         match clause_status s.valn cls with
         | Unit (i, pos as l) ->
@@ -177,18 +160,21 @@ let infer s =
              (pp_clause s.name_table) cls
              (pp_lit s.name_table) l; *)
           assert (s.valn.(i) = None);
-          Queue.push (cls_id, l) q
-        (* let watch_set = if pos then s.neg_set else s.pos_set in
-           ac' := S.union watch_set.(i) !ac' *)
-        | Satisfied -> ()
+          Queue.push l q;
+          Queue.push cls_id sat;
+          let watch_set = if pos then s.neg_set else s.pos_set in
+          w' := S.union watch_set.(i) !w'
+        | Satisfied -> Queue.push cls_id sat
         (* Format.printf "clause (%a) is satisfied@." (pp_clause s.name_table) cls *)
         | Unsat -> raise Exn_Conflict
         | Other -> ()
-      done;
+      end;
+      head.active_clauses <-
+        S.diff head.active_clauses (sat |> Queue.to_seq |> S.of_seq);
       if Queue.is_empty q then No_Conflict
       else begin
         while not (Queue.is_empty q) do
-          let cls_id, (i, pos) = Queue.pop q in
+          let (i, pos) = Queue.pop q in
           Format.printf "setting %s to %b (infer)@."
             s.name_table.(i) pos;
           assert (s.valn.(i) <> Some pos);
@@ -197,11 +183,11 @@ let infer s =
           head.inferred_vars <- i :: head.inferred_vars;
           print_valn s
         done;
-        loop ()
+        loop !w'
       end
     end
   in
-  try loop () with Exn_Conflict -> Conflict
+  try loop head.active_clauses with Exn_Conflict -> Conflict
 
 let decide s =
   let n = Array.length s.valn in
@@ -230,8 +216,8 @@ let solve instance =
   let valn = Array.make nvar None in
   let top = {
     guess = None;
-    inferred_vars = []
-    (* active_clauses = S.of_list (range 0 (Array.length clauses)) *)
+    inferred_vars = [];
+    active_clauses = S.of_list (range 0 (Array.length clauses))
   } in
   let solver = {
     clauses = DynArray.of_array clauses;
@@ -256,15 +242,15 @@ let solve instance =
     | No_Conflict ->
       assert (no_unit_clauses solver);
       begin match decide solver with
-        | None -> check_sanity solver; true
+        | None -> assert (all_sat solver); true
         | Some (i, v) as guess ->
           Format.printf "setting %s to %b (guess)@." name_table.(i) v;
           valn.(i) <- Some v;
           print_valn solver;
           let dec = {
             guess;
-            inferred_vars = []
-            (* active_clauses = solver.neg_set.(i) *)
+            inferred_vars = [];
+            active_clauses = (List.hd solver.trail).active_clauses
           } in
           solver.trail <- dec :: solver.trail;
           loop ()
